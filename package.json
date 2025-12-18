@@ -1,0 +1,27 @@
+{
+  "name": "openhvx-storage-controller",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Storage controller that talks to the OpenHVX broker (AMQP) and interfaces with Ceph.",
+  "main": "dist/app.js",
+  "scripts": {
+    "dev": "ts-node-dev --respawn --transpileOnly src/app.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/app.js",
+    "lint": "eslint \"src/**/*.{ts,tsx}\" --max-warnings=0",
+    "test:ceph": "ts-node src/test.ts"
+  },
+  "dependencies": {
+    "amqplib": "^0.10.4",
+    "axios": "^1.6.7",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.6",
+    "@types/amqplib": "^0.10.5",
+    "eslint": "^8.56.0",
+    "ts-node": "^10.9.2",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.3.3"
+  }
+}
