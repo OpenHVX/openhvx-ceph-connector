@@ -42,6 +42,7 @@ Agent that orchestrates Ceph volumes through RBD and iSCSI while exchanging task
 | Variable | Example | Description |
 | --- | --- | --- |
 | `INVENTORY_INTERVAL_MS` | `300000` | Interval between inventory publishes (ms) |
+| `HEARTBEAT_INTERVAL_MS` | `60000` | Interval between heartbeat publishes (ms) |
 | `CREATE_READINESS_TIMEOUT_MS` | `180000` | Timeout for create readiness steps (ms) |
 
 **Logging**

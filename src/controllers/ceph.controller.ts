@@ -80,6 +80,11 @@ export class CephController {
     return this.api.deleteBlockImageFromTrash(selectedPool, name, namespace);
   }
 
+  async resizeDisk(name: string, sizeBytes: number, pool?: string, namespace?: string): Promise<unknown> {
+    const selectedPool = this.resolvePool(pool);
+    return this.api.resizeBlockImage(selectedPool, name, sizeBytes, namespace);
+  }
+
   /**
    * Move an RBD image to the trash with an optional delayed deletion.
    */
@@ -476,7 +481,6 @@ export class CephController {
       this.api.getTargets(),
       this.api.getRBDs('catalog').catch(() => []), // catalog pool is optional
     ]);
-
     const targets = Array.isArray(targetsRes) ? targetsRes : [];
     const rbdMetaByPool = await this.loadRbdMetadataForTargets(targets);
 
@@ -514,12 +518,19 @@ export class CephController {
   }
 
   private extractCapacity(raw: any, volumes: StorageInventoryV1['volumes']): StorageInventoryV1['capacity'] {
-    const pgmap = (raw as any)?.pgmap ?? {};
-    const totalBytes = this.toNumber(pgmap.bytes_total) || this.sum(volumes.map((v) => v.sizeBytes));
-    const usedBytes =
-      this.toNumber(pgmap.bytes_used) || this.sum(volumes.map((v) => v.usedBytes ?? 0));
-    const availBytes =
-      this.toNumber(pgmap.bytes_avail) || Math.max(totalBytes - usedBytes, 0);
+    const dfStats = (raw as any)?.df?.stats ?? {};
+
+    const dfTotal = this.toOptionalNumber(dfStats.total_bytes);
+    const dfAvail = this.toOptionalNumber(dfStats.total_avail_bytes);
+    const dfUsed = this.toOptionalNumber(dfStats.total_used_raw_bytes);
+
+    const volumesTotal = this.sum(volumes.map((v) => v.sizeBytes));
+    const volumesUsed = this.sum(volumes.map((v) => v.usedBytes ?? v.sizeBytes ?? 0));
+
+    const totalBytes = dfTotal ?? volumesTotal;
+    const usedFromAvail = dfAvail !== undefined && dfTotal !== undefined ? Math.max(dfTotal - dfAvail, 0) : undefined;
+    const usedBytes = dfUsed ?? usedFromAvail ?? volumesUsed;
+    const availBytes = dfAvail ?? (totalBytes !== undefined ? Math.max(totalBytes - usedBytes, 0) : 0);
 
     return {
       totalBytes,
@@ -539,7 +550,14 @@ export class CephController {
       .map((item: any) => ({
         name: item?.name ?? item?.image ?? item?.id,
         sizeBytes: this.toNumber(item?.size ?? item?.size_bytes),
-        usedBytes: item?.used_size ?? item?.used_bytes,
+        usedBytes: this.toOptionalNumber(
+          item?.total_disk_usage ??
+          item?.used_size ??
+          item?.used_bytes ??
+          item?.disk_usage ??
+          item?.usage ??
+          item?.actual_size
+        ),
         pool: item?.pool_name ?? pool,
         namespace: item?.namespace ?? item?.pool_namespace ?? '',
         snapshots: this.extractSnapshots(item),
@@ -581,6 +599,22 @@ export class CephController {
             };
             return acc;
           }, {});
+          const missingUsage = Object.entries(metaByPool[pool]).filter(([, meta]) => meta.usedBytes === undefined);
+          await Promise.all(
+            missingUsage.map(async ([key, meta]) => {
+              const [nsPart, imageName] = key.split('::');
+              const namespace = nsPart || undefined;
+              try {
+                const detail = await this.api.getImage(pool, imageName, { namespace, omitUsage: false });
+                const parsed = this.extractRbdEntries(detail, pool)[0];
+                if (parsed?.usedBytes !== undefined) {
+                  meta.usedBytes = parsed.usedBytes;
+                }
+              } catch {
+                // best effort; leave usedBytes undefined on failure
+              }
+            })
+          );
         } catch {
           // best effort; leave pool empty on failure
         }
@@ -636,9 +670,22 @@ export class CephController {
     });
   }
 
+  async getDiskInfo(name: string, pool?: string, namespace?: string): Promise<RbdEntry | null> {
+    const selectedPool = this.resolvePool(pool);
+    const entries = await this.listRbdEntries(selectedPool, 200, namespace);
+    return entries.find(
+      (e) => e.name === name && (namespace === undefined || e.namespace === namespace)
+    ) ?? null;
+  }
+
   private toNumber(value: unknown): number {
     const n = Number(value);
     return Number.isFinite(n) ? n : 0;
+  }
+
+  private toOptionalNumber(value: unknown): number | undefined {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : undefined;
   }
 
   private sum(values: Array<number | undefined>): number {

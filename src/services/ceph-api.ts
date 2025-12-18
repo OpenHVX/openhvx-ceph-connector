@@ -330,6 +330,13 @@ export class CephApi {
     return this.request('POST', path, { delay });
   }
 
+  async resizeBlockImage(pool: string, name: string, sizeBytes: number, namespace?: string): Promise<unknown> {
+    const imageSpec = this.buildImageSpec(pool, name, namespace);
+    const path = `/api/block/image/${imageSpec}`;
+    const payload = { size: sizeBytes };
+    return this.request('PUT', path, payload);
+  }
+
   // ---- Namespaces ----
 
   async listNamespaces(pool: string): Promise<unknown> {

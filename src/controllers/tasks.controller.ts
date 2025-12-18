@@ -81,6 +81,10 @@ export class TasksController {
         ? String(requestedNameRaw).trim()
         : '';
     const catalogImage = (data as any).imageId;
+    const requestedSizeMbRaw = (data as any).sizeMB ?? (data as any).sizeMb ?? (data as any).size_mb;
+    const requestedSizeMb = Number.isFinite(Number(requestedSizeMbRaw)) ? Number(requestedSizeMbRaw) : undefined;
+    const requestedSizeBytes =
+      requestedSizeMb !== undefined && requestedSizeMb > 0 ? requestedSizeMb * 1024 * 1024 : undefined;
     const tenantId = ((data as any).tenantId ?? task.tenantId ?? '').toString().trim() || undefined;
     const requestedSnapshot = 'base';
     const destPool = config.ceph.defaultPool;
@@ -157,6 +161,31 @@ export class TasksController {
       }
 
       await this.ceph.waitForImageReady(destPool, destName, readinessTimeout, undefined);
+
+      if (requestedSizeBytes !== undefined) {
+        const meta = await this.ceph.getDiskInfo(destName, destPool);
+        if (!meta) {
+          return this.fail(task, 'storage.create: failed to read destination image metadata for resize');
+        }
+        const currentSize = meta.sizeBytes;
+        if (requestedSizeBytes > currentSize) {
+          logger.info('storage.create: resizing image', {
+            pool: destPool,
+            image: destName,
+            fromBytes: currentSize,
+            toBytes: requestedSizeBytes,
+          });
+          await this.ceph.resizeDisk(destName, requestedSizeBytes, destPool);
+          await this.ceph.waitForImageReady(destPool, destName, readinessTimeout, undefined);
+        } else if (requestedSizeBytes < currentSize) {
+          logger.warn('storage.create: requested size smaller than source, skipping shrink', {
+            pool: destPool,
+            image: destName,
+            requestedSizeBytes,
+            currentSize,
+          });
+        }
+      }
 
       const existingTarget = await this.ceph.findIscsiTarget(iqn);
       const targetExisted = Boolean(existingTarget);

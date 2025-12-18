@@ -118,6 +118,16 @@ export class AmqpService {
     });
   }
 
+  publishHeartbeat(payload: { agentId: string; version: string; capabilities: string[]; host: string; ts: string }): void {
+    if (!this.ch) throw new Error("Channel not initialized");
+    const routingKey = `heartbeat.${payload.agentId}`;
+    logger.debug("publishing heartbeat", { routingKey, payload });
+    this.ch.publish(TELE_EX, routingKey, Buffer.from(JSON.stringify(payload)), {
+      contentType: "application/json",
+      deliveryMode: 2,
+    });
+  }
+
   async close(): Promise<void> {
     await this.ch?.close();
     await this.conn?.close();
