@@ -5,6 +5,6 @@ services:
   ceph-connector:
     build:
       context: .
-      dockerfile: src/Dockerfile
+      dockerfile: ./Dockerfile
     env_file:
       - .env
