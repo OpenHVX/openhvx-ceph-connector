@@ -59,10 +59,6 @@ export class CephApi {
 
     this.client = axios.create({
       baseURL: options.baseUrl.replace(/\/$/, ''),
-      auth: {
-        username: options.username,
-        password: options.password,
-      },
       timeout: 15_000,
       httpsAgent,
       headers: {
