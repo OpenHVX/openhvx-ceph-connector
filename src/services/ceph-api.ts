@@ -108,8 +108,9 @@ export class CephApi {
     }
 
     const setCookie = res.headers['set-cookie'];
+    if (!token && !setCookie?.length) throw new Error('Ceph login returned no credentials');
     if (setCookie && setCookie.length > 0) {
-      this.client.defaults.headers.common.Cookie = setCookie.join('; ');
+      this.client.defaults.headers.common.Cookie = setCookie.map(cookie => cookie.split(';')[0]).join('; ');
     }
 
     this.client.defaults.headers.common.Accept = this.defaultAccept;
@@ -117,7 +118,7 @@ export class CephApi {
 
   private async ensureLogin(): Promise<void> {
     if (!this.loginPromise) {
-      this.loginPromise = this.login();
+      this.loginPromise = this.login().catch(error => { this.loginPromise = undefined; throw error; });
     }
     return this.loginPromise;
   }
@@ -152,6 +153,7 @@ export class CephApi {
         const resp = err?.response;
         lastErr = err;
 
+        if (resp?.status === 401) this.loginPromise = undefined;
         if (!resp || resp.status !== 415) {
           throw err;
         }
@@ -172,6 +174,7 @@ export class CephApi {
             this.acceptCache.set(cacheKey, expected);
             return res2;
           } catch (err2: any) {
+            if (err2?.response?.status !== 415) throw err2;
             lastErr = err2;
           }
         }

@@ -17,10 +17,8 @@ export type Config = {
       exchange: string;
     };
     service: {
-      name: string;
       agentId: string;
     };
-    prefetchCount: number;
   };
   ceph: {
     url: string;
@@ -57,13 +55,15 @@ const getEnvOptional = (key: string): string | undefined => {
   return trimmed.length > 0 ? trimmed : undefined;
 };
 
-const toNumber = (value: string, key: string): number => {
-  const parsed = Number(value);
-  if (Number.isNaN(parsed)) {
-    throw new Error(`Env var ${key} must be a number`);
-  }
-  return parsed;
+export const positiveInteger = (key: string, fallback: number): number => {
+  const value = Number(process.env[key] ?? fallback);
+  if (!Number.isSafeInteger(value) || value <= 0 || value > 2147483647) throw new Error(`${key} must be a positive integer within the timer range`);
+  return value;
 };
+
+if (process.env.RMQ_URL && process.env.BROKER_URL && process.env.RMQ_URL !== process.env.BROKER_URL) {
+  throw new Error('RMQ_URL and legacy BROKER_URL disagree');
+}
 
 const toBoolean = (value: string, key: string): boolean => {
   const normalized = value.trim().toLowerCase();
@@ -74,35 +74,33 @@ const toBoolean = (value: string, key: string): boolean => {
 
 export const config: Config = {
   broker: {
-    url: getEnv('BROKER_URL', 'amqp://guest:guest@localhost:5672/'),
+    url: getEnv('RMQ_URL', process.env.BROKER_URL),
     task: {
-      queue: getEnv('TASK_QUEUE', 'openhvx.storage.tasks'),
+      queue: getEnv('TASK_QUEUE', `agent.${getEnv('STORAGE_CONTROLLER_AGENT_ID')}.tasks`),
       exchange: getEnv('JOBS_EXCHANGE', 'jobs'),
     },
     telemetry: {
-      exchange: getEnv('TELEMETRY_EXCHANGE', 'openhvx.telemetry'),
-      routingKey: getEnv('TELEMETRY_ROUTING_KEY', 'storage'),
+      exchange: getEnv('TELEMETRY_EXCHANGE', 'agent.telemetry'),
+      routingKey: getEnv('TELEMETRY_ROUTING_KEY', 'inventory.storage.full'),
     },
     results: {
       exchange: getEnv('RESULTS_EXCHANGE', 'results'),
     },
     service: {
-      name: getEnv('SERVICE_NAME', 'storage-controller'),
-      agentId: getEnv('STORAGE_CONTROLLER_AGENT_ID', 'storage-controller-1'),
+      agentId: getEnv('STORAGE_CONTROLLER_AGENT_ID'),
     },
-    prefetchCount: toNumber(getEnv('PREFETCH_COUNT', '10'), 'PREFETCH_COUNT'),
   },
   ceph: {
-    url: getEnv('CEPH_API_URL', 'http://localhost:8003'),
-    user: getEnv('CEPH_API_USER', 'admin'),
-    password: getEnv('CEPH_API_PASSWORD', 'password'),
+    url: getEnv('CEPH_API_URL'),
+    user: getEnv('CEPH_API_USER'),
+    password: getEnv('CEPH_API_PASSWORD'),
     defaultPool: getEnv('CEPH_DEFAULT_POOL', 'rbd'),
     insecureTls: toBoolean(getEnv('CEPH_INSECURE_TLS', 'false'), 'CEPH_INSECURE_TLS'),
     apiAccept: getEnv('CEPH_API_ACCEPT', 'application/vnd.ceph.api.v1.0+json'),
     iscsi: {
       gw: {
-        host: getEnv('CEPH_GW_ISCSI_HOST', 'ceph-gw-01'),
-        ip: getEnv('CEPH_GW_ISCSI_IP', '127.0.0.1'),
+        host: getEnv('CEPH_GW_ISCSI_HOST'),
+        ip: getEnv('CEPH_GW_ISCSI_IP'),
       },
       auth: (() => {
         const user = getEnvOptional('CEPH_TARGET_USER');

@@ -1,10 +1,12 @@
-import { AmqpService, TaskMessage } from './services/amqp';
-import { config } from './config';
+import { AmqpService } from './services/amqp';
+import { config, positiveInteger } from './config';
 import { CephApi } from './services/ceph-api';
 import { CephController } from './controllers/ceph.controller';
 import { TasksController } from './controllers/tasks.controller';
 import logger from './lib/logger';
 import os from 'os';
+import http from 'node:http';
+import { OperationJournal } from './services/operations/journal';
 
 const amqp = new AmqpService();
 const cephApi = new CephApi({
@@ -16,18 +18,25 @@ const cephApi = new CephApi({
 });
 
 const cephController = new CephController(cephApi, config.ceph.defaultPool);
-const tasksController = new TasksController(cephController, amqp, config.broker.service.name);
-const INVENTORY_INTERVAL_MS = Number(process.env.INVENTORY_INTERVAL_MS || 300_000);
-const HEARTBEAT_INTERVAL_MS = Number(process.env.HEARTBEAT_INTERVAL_MS || 60_000);
+const tasksController = new TasksController(cephController, amqp, config.broker.service.agentId);
+const INVENTORY_INTERVAL_MS = positiveInteger('INVENTORY_INTERVAL_MS', 300000);
+const HEARTBEAT_INTERVAL_MS = positiveInteger('HEARTBEAT_INTERVAL_MS', 60000);
 const pkg = require('../package.json') as { version?: string };
 
+const journal = new OperationJournal();
+let stopping = false;
+const health = http.createServer(async (req, res) => {
+  if (req.url !== '/healthz' && req.url !== '/readyz') { res.writeHead(404).end(); return; }
+  res.writeHead(req.url === '/readyz' && (!amqp.ready || stopping || !await journal.healthy()) ? 503 : 200).end();
+});
+
 async function start(): Promise<void> {
+  if (!process.env.MONGO_URL) throw new Error('MONGO_URL required for durable operations');
+  await journal.open(process.env.MONGO_URL);
   await amqp.init();
 
-  await amqp.consumeTasks(async (task: TaskMessage) => {
-    logger.info('task received', { task });
-    return tasksController.handle(task);
-  });
+  await amqp.consumeTasks(task => journal.execute(task, () => tasksController.handle(task)));
+  health.listen(positiveInteger('PORT', 3000), '0.0.0.0');
 
   // Send a first inventory snapshot on startup
   await tasksController.refreshInventory().catch((err) => {
@@ -37,7 +46,7 @@ async function start(): Promise<void> {
   const heartbeatPayload = () => ({
     agentId: config.broker.service.agentId,
     version: pkg.version ?? 'unknown',
-    capabilities: ['storage'],
+    capabilities: ['storage', 'task.protocol.v2'],
     host: os.hostname(),
     ts: new Date().toISOString(),
   });
@@ -45,11 +54,14 @@ async function start(): Promise<void> {
   // Initial heartbeat
   amqp.publishHeartbeat(heartbeatPayload());
 
-  // Periodic inventory refresh
+  // Serialize periodic inventory collection to avoid overlapping slow Ceph calls.
+  let inventoryRunning = false;
   const inventoryTimer = setInterval(() => {
-    tasksController.refreshInventory().catch((err) => {
-      logger.error('Failed to publish periodic inventory', { err });
-    });
+    if (inventoryRunning || stopping) return;
+    inventoryRunning = true;
+    void tasksController.refreshInventory()
+      .catch(() => logger.error('Periodic inventory failed'))
+      .finally(() => { inventoryRunning = false; });
   }, INVENTORY_INTERVAL_MS);
 
   // Periodic heartbeat
@@ -62,9 +74,13 @@ async function start(): Promise<void> {
   }, HEARTBEAT_INTERVAL_MS);
 
   const shutdown = async () => {
+    if (stopping) return;
+    stopping = true;
+    health.close();
     clearInterval(inventoryTimer);
     clearInterval(heartbeatTimer);
     await amqp.close();
+    await journal.close();
     process.exit(0);
   };
 
@@ -73,6 +89,6 @@ async function start(): Promise<void> {
 }
 
 start().catch((err) => {
-  console.error(err);
+  logger.error('Connector startup failed', { error: err instanceof Error ? err.message : 'Unknown error' });
   process.exit(1);
 });

@@ -98,12 +98,8 @@ export class CephController {
    */
   async diskExists(name: string, pool?: string, namespace?: string): Promise<boolean> {
     const selectedPool = this.resolvePool(pool);
-    try {
-      const entries = await this.listRbdEntries(selectedPool, 200, namespace);
-      return entries.some((e) => e.name === name && (namespace === undefined || e.namespace === namespace));
-    } catch {
-      return false;
-    }
+    const entries = await this.listRbdEntries(selectedPool, 200, namespace);
+    return entries.some(e => e.name === name && (namespace === undefined || e.namespace === namespace));
   }
 
   /**
@@ -329,6 +325,34 @@ export class CephController {
     throw new Error(`Image ${pool}/${image} not ready after ${timeoutMs}ms`);
   }
 
+  async waitForDiskAbsent(pool: string, image: string, namespace: string | undefined, timeoutMs: number, pollMs = 3000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (!await this.diskExists(image, pool, namespace)) return;
+      await this.sleep(pollMs);
+    }
+    throw new Error('Image deletion completion could not be observed');
+  }
+
+  async waitForTargetAbsent(iqn: string, timeoutMs: number, pollMs = 3000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (!await this.findIscsiTarget(iqn)) return;
+      await this.sleep(pollMs);
+    }
+    throw new Error('Target deletion completion could not be observed');
+  }
+
+  async waitForImageSize(pool: string, image: string, expectedBytes: number, timeoutMs: number, pollMs = 3000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const disk = await this.getDiskInfo(image, pool);
+      if (disk?.sizeBytes === expectedBytes) return;
+      await this.sleep(pollMs);
+    }
+    throw new Error('Image resize completion could not be observed');
+  }
+
   /**
    * Wait until an iSCSI target is available on the gateway.
    */
@@ -336,7 +360,8 @@ export class CephController {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
       const targetsRes = await this.api.getTargets();
-      const targets = Array.isArray(targetsRes) ? targetsRes : [];
+      if (!Array.isArray(targetsRes)) throw new Error('Invalid Ceph target listing');
+    const targets = targetsRes;
       const found = targets.find((t: any) => t?.target_iqn === iqn || t?.iqn === iqn);
       if (found) return;
       await this.sleep(pollMs);
@@ -425,7 +450,8 @@ export class CephController {
     iqn: string
   ): Promise<{ iqn: string; disks: IscsiDiskRef[] } | null> {
     const targetsRes = await this.api.getTargets();
-    const targets = Array.isArray(targetsRes) ? targetsRes : [];
+    if (!Array.isArray(targetsRes)) throw new Error('Invalid Ceph target listing');
+    const targets = targetsRes;
     const match = targets.find((t: any) => t?.target_iqn === iqn || t?.iqn === iqn);
     if (!match) return null;
 
@@ -445,7 +471,8 @@ export class CephController {
     pool?: string
   ): Promise<Array<{ iqn: string; disks: IscsiDiskRef[] }>> {
     const targetsRes = await this.api.getTargets();
-    const targets = Array.isArray(targetsRes) ? targetsRes : [];
+    if (!Array.isArray(targetsRes)) throw new Error('Invalid Ceph target listing');
+    const targets = targetsRes;
 
     return targets
       .map((t: any) => {
@@ -481,7 +508,8 @@ export class CephController {
       this.api.getTargets(),
       this.api.getRBDs('catalog').catch(() => []), // catalog pool is optional
     ]);
-    const targets = Array.isArray(targetsRes) ? targetsRes : [];
+    if (!Array.isArray(targetsRes)) throw new Error('Invalid Ceph target listing');
+    const targets = targetsRes;
     const rbdMetaByPool = await this.loadRbdMetadataForTargets(targets);
 
     const cluster = this.extractCluster(healthRes);
@@ -728,43 +756,22 @@ export class CephController {
     pageSize = 200,
     namespace?: string
   ): Promise<RbdEntry[]> {
-    // Paginate defensively; filter namespaces client-side because the API breaks when sent as a query param.
     const all: RbdEntry[] = [];
     let offset = 0;
-    let lastPageKey = '';
-
+    const seen = new Set<string>();
     while (true) {
-      try {
-        const pageRaw = await this.api.getRBDs(pool, { offset, limit: pageSize });
-        let entries = this.extractRbdEntries(pageRaw, pool);
-        if (namespace !== undefined) {
-          entries = entries.filter((e) => e.namespace === namespace);
-        }
-        if (entries.length === 0) break;
-        const pageKey = entries.map((e) => `${e.namespace ?? ''}/${e.name}`).join('|');
-        if (offset > 0 && pageKey === lastPageKey) break;
-        all.push(...entries);
-        if (entries.length < pageSize) break;
-        lastPageKey = pageKey;
-        offset += pageSize;
-      } catch (err) {
-        if (offset === 0) throw err;
-        break;
-      }
+      const raw = await this.api.getRBDs(pool, { offset, limit: pageSize });
+      if (!Array.isArray(raw)) throw new Error('Invalid Ceph image listing');
+      const page = this.extractRbdEntries(raw, pool);
+      if (!page.length) break;
+      const key = page.map(e => `${e.namespace}/${e.name}`).join('|');
+      if (seen.has(key)) throw new Error('Ceph pagination did not advance; inventory incomplete');
+      seen.add(key);
+      all.push(...page.filter(e => namespace === undefined || e.namespace === namespace));
+      if (page.length < pageSize) break;
+      offset += pageSize;
+      if (offset > 100000) throw new Error('Ceph inventory pagination limit exceeded');
     }
-
-    if (all.length === 0) {
-      try {
-        let entries = this.extractRbdEntries(await this.api.getRBDs(pool), pool);
-        if (namespace !== undefined) {
-          entries = entries.filter((e) => e.namespace === namespace);
-        }
-        return entries;
-      } catch {
-        return [];
-      }
-    }
-
     return all;
   }
 }

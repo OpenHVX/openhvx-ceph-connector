@@ -1,231 +1,127 @@
-import { connect, Channel, ChannelModel, ConsumeMessage } from "amqplib";
-import { config } from "../config";
-import { StorageTelemetryEnvelopeV1, StorageInventoryV1 } from "../types/inventory";
-import logger from "../lib/logger";
+import { connect, Channel, ChannelModel, ConsumeMessage } from 'amqplib';
+import { config } from '../config';
+import { StorageTelemetryEnvelopeV1, StorageInventoryV1 } from '../types/inventory';
+import { Command, decodeCommand, InvalidCommand, Result } from './operations/protocol';
+import logger from '../lib/logger';
 
-const RMQ_URL = config.broker.url;
-const JOBS_EX = config.broker.task.exchange;
-const TELE_EX = config.broker.telemetry.exchange;
-const RES_EX = config.broker.results.exchange;
-const STORAGE_ID = config.broker.service.agentId;
-const TELE_ROUTING_KEY = config.broker.telemetry.routingKey;
-const TASK_QUEUE = config.broker.task.queue;
-const PREFETCH_COUNT = config.broker.prefetchCount;
-const RECONNECT_DELAY_MS = Number(process.env.BROKER_RECONNECT_DELAY_MS || 5000);
-
-const wait = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
-
-export type TaskMessage = {
-  taskId: string;
-  action: string;
-  data: Record<string, unknown>;
-  tenantId?: string;
-};
-
-export type TaskResult = {
-  taskId: string;
-  agentId: string;
-  ok: boolean;
-  result?: unknown;
-  error?: string;
-  finishedAt: string;
-};
+export type TaskMessage = Pick<Command, 'taskId' | 'action' | 'data'> & Partial<Command>;
+export type TaskResult = { taskId: string; agentId: string; ok: boolean; result?: unknown; error?: string; finishedAt: string };
+const queueType = process.env.AMQP_QUEUE_TYPE || 'classic';
+if (!['classic', 'quorum'].includes(queueType)) throw new Error('AMQP_QUEUE_TYPE must be classic or quorum');
+const queueArgs = { 'x-queue-type': queueType };
 
 export class AmqpService {
   private conn?: ChannelModel;
   private ch?: Channel;
-  private consumer?: (task: TaskMessage) => Promise<TaskResult>;
-  private connectPromise?: Promise<void>;
-  private reconnectTimer?: NodeJS.Timeout;
-  private shuttingDown = false;
+  private consumer?: (task: Command) => Promise<Result>;
+  private connecting?: Promise<void>;
+  private timer?: NodeJS.Timeout;
+  private stopping = false;
+  private consumerTag?: string;
+  private inFlight = new Set<Promise<void>>();
+  get ready(): boolean { return !!this.ch && !this.stopping; }
 
   async init(): Promise<void> {
-    await this.ensureConnected();
+    if (!this.connecting) this.connecting = this.open().finally(() => { this.connecting = undefined; });
+    await this.connecting;
   }
-
-  async consumeTasks(onTask: (task: TaskMessage) => Promise<TaskResult>): Promise<void> {
-    this.consumer = onTask;
-    if (!this.ch) {
-      await this.ensureConnected();
-    }
-    await this.startConsumer(onTask);
-  }
-
-  publishResult(action: string, result: TaskResult): void {
-    const ch = this.getChannel();
-    if (!ch) {
-      logger.warn("dropping result publish, channel unavailable", { action });
-      return;
-    }
-    logger.debug("publishing result", { action, result });
-    ch.publish(RES_EX, `task.${action}`, Buffer.from(JSON.stringify(result)), {
-      contentType: "application/json",
-      deliveryMode: 2,
-      correlationId: result.taskId,
+  private async open(): Promise<void> {
+    const conn = await connect(config.broker.url);
+    conn.on('error', () => logger.warn('AMQP connection error'));
+    conn.on('close', () => {
+      if (this.conn !== conn) return;
+      this.conn = undefined; this.ch = undefined; this.consumerTag = undefined;
+      this.reconnect();
     });
-  }
-
-  publishTelemetry(inventory: StorageInventoryV1): void {
-    const ch = this.getChannel();
-    if (!ch) {
-      logger.warn("dropping telemetry publish, channel unavailable");
-      return;
-    }
-    const payload: StorageTelemetryEnvelopeV1 = {
-      storageId: STORAGE_ID,
-      ts: new Date().toISOString(),
-      inventory,
-    };
-
-    logger.info("publishing telemetry", { storageId: payload.storageId });
-    logger.debug("publishing telemetry payload", { payload });
-    ch.publish(TELE_EX, TELE_ROUTING_KEY, Buffer.from(JSON.stringify(payload)), {
-      contentType: "application/json",
-      deliveryMode: 2,
-    });
-  }
-
-  publishEvent(payload: unknown, routingKey = TELE_ROUTING_KEY): void {
-    const ch = this.getChannel();
-    if (!ch) {
-      logger.warn("dropping event publish, channel unavailable", { routingKey });
-      return;
-    }
-    logger.info("publishing event", { routingKey, payload });
-    ch.publish(TELE_EX, routingKey, Buffer.from(JSON.stringify(payload)), {
-      contentType: "application/json",
-      deliveryMode: 2,
-    });
-  }
-
-  publishHeartbeat(payload: { agentId: string; version: string; capabilities: string[]; host: string; ts: string }): void {
-    const ch = this.getChannel();
-    if (!ch) {
-      logger.warn("dropping heartbeat, channel unavailable", { agentId: payload.agentId });
-      return;
-    }
-    const routingKey = `heartbeat.${payload.agentId}`;
-    logger.debug("publishing heartbeat", { routingKey, payload });
-    ch.publish(TELE_EX, routingKey, Buffer.from(JSON.stringify(payload)), {
-      contentType: "application/json",
-      deliveryMode: 2,
-    });
-  }
-
-  async close(): Promise<void> {
-    this.shuttingDown = true;
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = undefined;
-    }
-    await this.ch?.close();
-    await this.conn?.close();
-  }
-
-  private async ensureConnected(): Promise<void> {
-    if (!this.connectPromise) {
-      this.connectPromise = this.connectWithRetry();
-    }
-    await this.connectPromise;
-  }
-
-  private async connectWithRetry(): Promise<void> {
-    while (!this.shuttingDown) {
-      try {
-        await this.createConnection();
-        return;
-      } catch (err) {
-        logger.error("failed to connect to AMQP, retrying", { err, delayMs: RECONNECT_DELAY_MS });
-        await wait(RECONNECT_DELAY_MS);
-      }
-    }
-  }
-
-  private async createConnection(): Promise<void> {
-    logger.info("connecting to AMQP", { url: RMQ_URL });
-    const conn = await connect(RMQ_URL);
     this.conn = conn;
-    conn.on("error", (err) => {
-      if (this.shuttingDown) return;
-      logger.error("AMQP connection error", { err });
-    });
-    conn.on("close", () => {
-      if (this.shuttingDown) return;
-      logger.warn("AMQP connection closed, scheduling reconnect", { delayMs: RECONNECT_DELAY_MS });
-      this.cleanupConnection();
-      this.connectPromise = undefined;
-      this.scheduleReconnect();
-    });
-
-    const ch = await conn.createChannel();
-    this.ch = ch;
-
-    await this.setupTopology(ch);
-
-    if (this.consumer) {
-      await this.startConsumer(this.consumer);
-    }
-
-    logger.info("AMQP ready", {
-      exchanges: { jobs: JOBS_EX, telemetry: TELE_EX, results: RES_EX },
-      queue: TASK_QUEUE || `agent.${STORAGE_ID}.tasks`,
-      prefetch: PREFETCH_COUNT,
-    });
+    try {
+      const ch = await conn.createChannel();
+      ch.on('error', () => logger.warn('AMQP channel error'));
+      ch.on('close', () => { if (this.conn === conn) void conn.close().catch(() => {}); });
+      await ch.assertExchange(config.broker.task.exchange, 'direct', { durable: true });
+      await ch.assertExchange(config.broker.telemetry.exchange, 'topic', { durable: true });
+      await ch.assertExchange(config.broker.results.exchange, 'topic', { durable: true });
+      await ch.assertQueue(`${config.broker.task.queue}.invalid`, { durable: true, arguments: queueArgs });
+      await ch.assertQueue(config.broker.task.queue, { durable: true, arguments: queueArgs });
+      await ch.bindQueue(config.broker.task.queue, config.broker.task.exchange, config.broker.service.agentId);
+      await ch.prefetch(1);
+      this.ch = ch;
+      if (this.consumer) await this.startConsumer();
+    } catch (error) { await conn.close().catch(() => {}); throw error; }
   }
-
-  private async setupTopology(ch: Channel): Promise<void> {
-    await ch.prefetch(PREFETCH_COUNT);
-    await ch.assertExchange(JOBS_EX, "direct", { durable: true });
-    await ch.assertExchange(TELE_EX, "topic", { durable: true });
-    await ch.assertExchange(RES_EX, "topic", { durable: true });
+  private reconnect(): void {
+    if (this.stopping || this.timer) return;
+    this.timer = setTimeout(() => {
+      this.timer = undefined;
+      void this.init().catch(() => this.reconnect());
+    }, 5000);
   }
-
-  private async startConsumer(onTask: (task: TaskMessage) => Promise<TaskResult>): Promise<void> {
-    const ch = this.getChannel();
-    if (!ch) {
-      throw new Error("Channel not initialized");
-    }
-    const queue = TASK_QUEUE || `agent.${STORAGE_ID}.tasks`;
-    await ch.assertQueue(queue, { durable: true });
-    await ch.bindQueue(queue, JOBS_EX, STORAGE_ID);
-
-    ch.consume(queue, async (msg: ConsumeMessage | null) => {
-      if (!msg) return;
-      const parsed = JSON.parse(msg.content.toString()) as TaskMessage;
+  async consumeTasks(consumer: (task: Command) => Promise<Result>): Promise<void> {
+    this.consumer = consumer;
+    await this.startConsumer();
+  }
+  private async startConsumer(): Promise<void> {
+    const ch = this.ch;
+    if (!ch || !this.consumer || this.consumerTag) return;
+    const result = await ch.consume(config.broker.task.queue, (msg) => {
+      if (!msg) { void this.conn?.close().catch(() => {}); return; }
+      const pending = this.handle(ch, msg).finally(() => this.inFlight.delete(pending));
+      this.inFlight.add(pending);
+    }, { noAck: false, exclusive: true });
+    this.consumerTag = result.consumerTag;
+  }
+  private async handle(ch: Channel, msg: ConsumeMessage): Promise<void> {
+    try {
+      let command: Command;
+      try { command = decodeCommand(JSON.parse(msg.content.toString('utf8')), config.broker.service.agentId); }
+      catch { throw new InvalidCommand('Invalid command'); }
+      const result = await this.consumer!(command);
+      await this.confirm(config.broker.results.exchange, `task.${command.action}`, Buffer.from(JSON.stringify(result)), result.eventId);
+      ch.ack(msg);
+    } catch (error) {
       try {
-        const result = await onTask(parsed);
-        this.publishResult(parsed.action, result);
-        ch.ack(msg);
-      } catch (error) {
-        const fail: TaskResult = {
-          taskId: parsed.taskId,
-          agentId: STORAGE_ID,
-          ok: false,
-          error: (error as Error).message,
-          finishedAt: new Date().toISOString(),
-        };
-        this.publishResult(parsed.action, fail);
-        ch.ack(msg);
-      }
-    });
+        if (error instanceof InvalidCommand) {
+          await this.confirm('', `${config.broker.task.queue}.invalid`, msg.content, msg.properties.messageId);
+          ch.ack(msg);
+        } else ch.nack(msg, false, true);
+      } catch { /* Closed delivery channel: broker redelivers the persisted operation. */ }
+      logger.warn('Task delivery deferred or quarantined', { invalid: error instanceof InvalidCommand });
+    }
   }
-
-  private scheduleReconnect(): void {
-    if (this.reconnectTimer || this.shuttingDown) return;
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = undefined;
-      void this.ensureConnected();
-    }, RECONNECT_DELAY_MS);
+  private async confirm(exchange: string, key: string, body: Buffer, eventId?: string): Promise<void> {
+    const conn = this.conn;
+    if (!conn) throw new Error('AMQP unavailable');
+    const channel = await conn.createConfirmChannel();
+    channel.on('error', () => {});
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('Publisher confirm timeout')), 20000);
+        const finish = (error?: Error | null) => { clearTimeout(timer); error ? reject(error) : resolve(); };
+        channel.once('return', () => finish(new Error('Unroutable message')));
+        channel.once('close', () => finish(new Error('Publisher closed')));
+        channel.publish(exchange, key, body, { persistent: true, mandatory: true, contentType: 'application/json', messageId: eventId }, finish);
+      });
+    } finally { await channel.close().catch(() => {}); }
   }
-
-  private cleanupConnection(): void {
+  publishTelemetry(inventory: StorageInventoryV1): void {
+    const payload: StorageTelemetryEnvelopeV1 = { storageId: config.broker.service.agentId, ts: new Date().toISOString(), inventory };
+    this.publishEvent(payload, config.broker.telemetry.routingKey);
+  }
+  publishEvent(payload: unknown, routingKey = config.broker.telemetry.routingKey): void {
+    if (!this.ch) throw new Error('AMQP unavailable');
+    this.ch.publish(config.broker.telemetry.exchange, routingKey, Buffer.from(JSON.stringify(payload)), { persistent: true, contentType: 'application/json' });
+  }
+  publishHeartbeat(payload: { agentId: string; version: string; capabilities: string[]; host: string; ts: string }): void {
+    this.publishEvent(payload, `heartbeat.${payload.agentId}`);
+  }
+  async close(): Promise<void> {
+    this.stopping = true;
+    if (this.timer) clearTimeout(this.timer);
+    if (this.ch && this.consumerTag) await this.ch.cancel(this.consumerTag).catch(() => {});
+    let timer: NodeJS.Timeout | undefined;
+    await Promise.race([Promise.allSettled([...this.inFlight]), new Promise(resolve => { timer = setTimeout(resolve, 30000); })]);
+    if (timer) clearTimeout(timer);
+    await this.conn?.close().catch(() => {});
     this.ch = undefined;
-    this.conn = undefined;
-  }
-
-  private getChannel(): Channel | undefined {
-    if (this.ch) return this.ch;
-    this.scheduleReconnect();
-    return undefined;
   }
 }

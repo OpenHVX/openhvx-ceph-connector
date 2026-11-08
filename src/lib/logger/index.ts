@@ -48,21 +48,14 @@ function levelName(value: number): LevelName {
     return entry ? entry[0] : "info";
 }
 
-function serializeError(err: unknown): Record<string, unknown> | unknown | undefined {
-    if (!err) return undefined;
-    if (err instanceof Error) {
-        const extra = { ...(err as unknown as Record<string, unknown>) };
-        delete extra.message;
-        delete extra.name;
-        delete extra.stack;
-        return {
-            message: err.message,
-            stack: err.stack,
-            name: err.name,
-            ...extra,
-        };
-    }
-    return err;
+function redact(value: unknown, key = '', depth = 0): unknown {
+    if (/password|secret|token|authorization|cookie|commandBody|config|headers/i.test(key)) return '[redacted]';
+    if (depth > 8) return '[truncated]';
+    if (value instanceof Error) return { name: value.name, message: redact(value.message, '', depth + 1) };
+    if (typeof value === 'string') return value.replace(/(amqps?|https?):\/\/[^\s/@]+:[^\s/@]+@/g, '$1://[redacted]@');
+    if (Array.isArray(value)) return value.map(item => redact(item, '', depth + 1));
+    if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, redact(v, k, depth + 1)]));
+    return value;
 }
 
 function safeStringify(obj: unknown): string {
@@ -94,12 +87,10 @@ function baseLog({ ns }: { ns?: string | string[] }): Logger {
             service: SERVICE || undefined,
             pid: process.pid,
             msg: String(msg ?? ""),
-            ...(meta ? { meta } : {}),
+            ...(meta ? { meta: redact(meta) as LogMeta } : {}),
         };
 
         if (AS_JSON) {
-            if (payload.meta?.error) payload.meta.error = serializeError(payload.meta.error);
-            if (payload.meta?.err) payload.meta.err = serializeError(payload.meta.err);
             const line = safeStringify(payload);
             if (levelValue >= LEVELS.error) {
                 console.error(line);
