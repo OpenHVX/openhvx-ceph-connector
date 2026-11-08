@@ -325,6 +325,24 @@ export class CephController {
     throw new Error(`Image ${pool}/${image} not ready after ${timeoutMs}ms`);
   }
 
+  async waitForDiskAbsent(pool: string, image: string, namespace: string | undefined, timeoutMs: number, pollMs = 3000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (!await this.diskExists(image, pool, namespace)) return;
+      await this.sleep(pollMs);
+    }
+    throw new Error('Image deletion completion could not be observed');
+  }
+
+  async waitForTargetAbsent(iqn: string, timeoutMs: number, pollMs = 3000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (!await this.findIscsiTarget(iqn)) return;
+      await this.sleep(pollMs);
+    }
+    throw new Error('Target deletion completion could not be observed');
+  }
+
   async waitForImageSize(pool: string, image: string, expectedBytes: number, timeoutMs: number, pollMs = 3000): Promise<void> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {

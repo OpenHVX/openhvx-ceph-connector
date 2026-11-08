@@ -41,3 +41,17 @@ test('resize readiness observes requested size rather than mere image presence',
   ceph.getDiskInfo = async () => ({ name: 'disk', pool: 'rbd', sizeBytes: 10 });
   await assert.rejects(ceph.waitForImageSize('rbd', 'disk', 20, 10, 1), /completion could not be observed/);
 });
+
+test('deletion readiness waits for observed absence and propagates failed host reads', async () => {
+  const ceph = new CephController({} as any);
+  let diskReads = 0;
+  ceph.diskExists = async () => ++diskReads < 2;
+  await ceph.waitForDiskAbsent('rbd', 'disk', undefined, 1000, 1);
+  assert.equal(diskReads, 2);
+  ceph.diskExists = async () => { throw new Error('read unavailable'); };
+  await assert.rejects(ceph.waitForDiskAbsent('rbd', 'disk', undefined, 1000, 1), /read unavailable/);
+  let targetReads = 0;
+  ceph.findIscsiTarget = async () => ++targetReads < 2 ? { iqn: 'target', disks: [] } : null;
+  await ceph.waitForTargetAbsent('target', 1000, 1);
+  assert.equal(targetReads, 2);
+});

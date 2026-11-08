@@ -15,6 +15,7 @@ The connector receives the resulting protocol v2 commands through RabbitMQ.
 The tenant comes from the immutable command identity. Gateway portals come from
 connector configuration. Creation returns `disk.id`, `disk.refId`, `disk.name`,
 `disk.iqn`, and `disk.tenantId`; image-based IDs agree with inventory references.
+Resize and deletion completion are observed before returning success.
 Creation refuses a requested size smaller than the cloned source and retains the
 partial clone for investigation.
 

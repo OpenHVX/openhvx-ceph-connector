@@ -273,6 +273,7 @@ export class TasksController {
       for (const iqn of uniqueIqns) {
         try {
           await this.ceph.deleteIscsiTarget(iqn);
+          await this.ceph.waitForTargetAbsent(iqn, positiveInteger('CREATE_READINESS_TIMEOUT_MS', 180000));
           targetDeleted = true;
         } catch (err: any) {
           const status = err?.response?.status ?? err?.status;
@@ -308,7 +309,8 @@ export class TasksController {
         continue;
       }
       try {
-        await this.ceph.deleteDisk(disk.image, disk.pool, (disk as any).namespace);
+        await this.ceph.deleteDisk(disk.image, disk.pool, disk.namespace);
+        await this.ceph.waitForDiskAbsent(disk.pool, disk.image, disk.namespace, positiveInteger('CREATE_READINESS_TIMEOUT_MS', 180000));
         deletedDisks.push({ pool: disk.pool, image: disk.image, namespace: (disk as any).namespace });
       } catch (err: any) {
         const status = err?.response?.status ?? err?.status;
