@@ -1,0 +1,39 @@
+name: Connector checks
+on:
+  push:
+  pull_request:
+jobs:
+  connector:
+    runs-on: ubuntu-latest
+    services:
+      rabbitmq:
+        image: rabbitmq:3-management
+        env:
+          RABBITMQ_DEFAULT_USER: integration
+          RABBITMQ_DEFAULT_PASS: integration-only-password
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+    env:
+      RMQ_URL: amqp://integration:integration-only-password@127.0.0.1:5672/
+      AMQP_INTEGRATION_URL: amqp://integration:integration-only-password@127.0.0.1:5672/
+      STORAGE_CONTROLLER_AGENT_ID: test-storage
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+      - run: npm audit --omit=dev --audit-level=low
+      - run: npm test
+      - name: Validate optional local Compose configuration
+        run: |
+          cp .env.example .env
+          docker compose -f compose.yaml config --quiet
+      - run: docker build -t openhvx-ceph-connector:ci .
+      - run: git diff --check

@@ -74,4 +74,5 @@ docker-compose.override.yml
 *.7z
 *.tar
 *.gz
-*.bz2       
+*.bz2
+!.env.example

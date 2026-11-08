@@ -1,33 +1,9 @@
 import type { CephController } from './ceph.controller';
-import { randomUUID, randomBytes } from 'crypto';
+import { createHash } from 'node:crypto';
 import { AmqpService, TaskMessage, TaskResult } from '../services/amqp';
-import { config } from '../config';
+import { config, positiveInteger } from '../config';
 import type { TargetPortal } from '../types/iscsi/target';
 import logger from '../lib/logger';
-
-/**
- * Simple LIFO rollback helper to keep storage.create transactional.
- * Each registered step must undo a previously completed operation.
- */
-class RollbackStack {
-  private steps: Array<() => Promise<void>> = [];
-
-  add(step: () => Promise<void>): void {
-    this.steps.push(step);
-  }
-
-  async run(): Promise<void> {
-    while (this.steps.length > 0) {
-      const step = this.steps.pop();
-      if (!step) continue;
-      try {
-        await step();
-      } catch (err) {
-        logger.warn('rollback step failed', { err });
-      }
-    }
-  }
-}
 
 export class TasksController {
   constructor(
@@ -66,12 +42,12 @@ export class TasksController {
   /**
    * storage.create flow:
    * - Validate payload and resolve the requested catalog snapshot
-   * - Build destination image name using tenantId prefix and random suffix
-   * - Clone catalog snapshot to destination image (or reuse existing)
+   * - Build destination image name using tenantId prefix and operation-derived suffix
+   * - Clone catalog snapshot to a dedicated destination image
    * - Wait for image readiness
-   * - Expose iSCSI target (or reuse existing) then wait for readiness
+   * - Expose a dedicated iSCSI target and verify its disk mapping
    * - Refresh/publish inventory and return result
-   * Any failure triggers rollback steps in reverse order.
+   * Failures preserve partial resources for operator reconciliation.
    */
   private async handleStorageCreate(task: TaskMessage): Promise<TaskResult> {
     const data = task.data || {};
@@ -85,18 +61,19 @@ export class TasksController {
     const requestedSizeMb = Number.isFinite(Number(requestedSizeMbRaw)) ? Number(requestedSizeMbRaw) : undefined;
     const requestedSizeBytes =
       requestedSizeMb !== undefined && requestedSizeMb > 0 ? requestedSizeMb * 1024 * 1024 : undefined;
-    const tenantId = ((data as any).tenantId ?? task.tenantId ?? '').toString().trim() || undefined;
+    const tenantId = task.tenantId;
     const requestedSnapshot = 'base';
     const destPool = config.ceph.defaultPool;
     const destName = requestedName
-      ? this.buildTenantImageName(tenantId ?? '', requestedName)
+      ? this.buildTenantImageName(tenantId ?? '', requestedName, task.taskId)
       : undefined;
     const iqn = destName ? `iqn.2001-07.org.openhvx:${destName}` : '';
     const lun = 0;
     const backstore = 'user:rbd';
-    const rollback = new RollbackStack();
-    const readinessTimeout = Number(process.env.CREATE_READINESS_TIMEOUT_MS || 180_000);
 
+    const readinessTimeout = positiveInteger('CREATE_READINESS_TIMEOUT_MS', 180000);
+
+    if (!Number.isSafeInteger(requestedSizeMb) || !requestedSizeMb || requestedSizeMb <= 0) return this.fail(task, 'sizeMB must be a positive integer');
     if (!requestedName) {
       return this.fail(task, 'storage.create: missing required field "name"');
     }
@@ -110,14 +87,7 @@ export class TasksController {
       return this.fail(task, 'storage.create: invalid tenantId or name');
     }
 
-    const portals: TargetPortal[] = Array.isArray((data as any).portals)
-      ? (data as any).portals
-      : [
-          {
-            host: config.ceph.iscsi.gw.host,
-            ip: config.ceph.iscsi.gw.ip,
-          },
-        ];
+    const portals: TargetPortal[] = [{ host: config.ceph.iscsi.gw.host, ip: config.ceph.iscsi.gw.ip }];
 
     const snapshot = await this.ceph.resolveCatalogSnapshotName(catalogImage, requestedSnapshot);
     if (!snapshot) {
@@ -144,20 +114,10 @@ export class TasksController {
           configuration: undefined,
           metadata: undefined,
         });
-        rollback.add(async () => {
-          await this.ceph.deleteDisk(destName, destPool);
-          logger.info('rollback: deleted cloned image', {
-            pool: destPool,
-            image: destName,
-            tenantId,
-          });
-        });
+
       } else {
-        logger.info('storage.create: image already exists, reusing as-is', {
-          pool: destPool,
-          image: destName,
-          tenantId,
-        });
+        return this.fail(task, 'Destination image already exists; ownership requires reconciliation');
+
       }
 
       await this.ceph.waitForImageReady(destPool, destName, readinessTimeout, undefined);
@@ -176,14 +136,9 @@ export class TasksController {
             toBytes: requestedSizeBytes,
           });
           await this.ceph.resizeDisk(destName, requestedSizeBytes, destPool);
-          await this.ceph.waitForImageReady(destPool, destName, readinessTimeout, undefined);
+          await this.ceph.waitForImageSize(destPool, destName, requestedSizeBytes, readinessTimeout);
         } else if (requestedSizeBytes < currentSize) {
-          logger.warn('storage.create: requested size smaller than source, skipping shrink', {
-            pool: destPool,
-            image: destName,
-            requestedSizeBytes,
-            currentSize,
-          });
+          return this.fail(task, 'Requested size is smaller than the source image; partial clone retained');
         }
       }
 
@@ -199,22 +154,23 @@ export class TasksController {
           lun,
           backstore,
         });
-        rollback.add(async () => {
-          await this.ceph.deleteIscsiTarget(iqn);
-          logger.info('rollback: deleted iscsi target', { iqn });
-        });
+
       } else {
-        logger.info('storage.create: target already exists, reusing', { iqn });
+        return this.fail(task, 'Destination target already exists; ownership requires reconciliation');
       }
 
       await this.ceph.waitForIscsiTarget(iqn, readinessTimeout);
+      const readyTarget = await this.ceph.findIscsiTarget(iqn);
+      if (!readyTarget || readyTarget.disks.length !== 1 || readyTarget.disks[0].pool !== destPool || readyTarget.disks[0].image !== destName) {
+        return this.fail(task, 'Target mapping could not be verified');
+      }
 
-      const inventory = await this.ceph.collectInventory(this.storageId);
-      this.amqp.publishTelemetry(inventory);
+      await this.refreshInventory().catch(() => logger.warn('Post-operation inventory deferred'));
 
       return this.ok(task, {
         disk: {
-          refId: iqn,
+          refId: destName,
+          iqn,
           name: destName,
           id: destName,
           tenantId,
@@ -240,8 +196,8 @@ export class TasksController {
         image: destName,
         tenantId,
       });
-      logger.debug('storage.create failed (raw)', { status, data, source: err?.config?.url, err });
-      await rollback.run();
+
+
       return this.fail(task, msg);
     }
   }
@@ -268,12 +224,18 @@ export class TasksController {
 
   private async handleStorageDelete(task: TaskMessage): Promise<TaskResult> {
     const data = task.data || {};
-    const refId = (data as any).refId || (data as any).iqn;
+    const target = (data as any).target;
+    const refId = target?.refId;
+    if (target?.agentId && target.agentId !== this.storageId) return this.fail(task, 'Target agent mismatch');
+    if ((data as any).refId && (data as any).refId !== refId) return this.fail(task, 'Conflicting target identity');
     const sizeMB = (data as any).sizeMB ?? (data as any).sizeMb;
     const pool = (data as any).pool || config.ceph.defaultPool;
     if (!refId) {
       return this.fail(task, 'storage.delete: missing required field "refId"');
     }
+
+    if (pool !== config.ceph.defaultPool) return this.fail(task, 'Unsupported pool');
+    if (typeof refId !== 'string' || !refId.startsWith(`${this.normalizeSegment(task.tenantId || '')}-`)) return this.fail(task, 'Target does not belong to tenant naming scope');
 
     const disks: Array<{ pool: string; image: string; namespace?: string }> = [];
     const iqnsToDelete: string[] = [];
@@ -291,6 +253,7 @@ export class TasksController {
       }
     } else {
       const matches = await this.ceph.findIscsiTargetsByDisk(refId, pool);
+      if (matches.some(match => match.disks.some(d => d.image !== refId || d.pool !== pool))) return this.fail(task, 'Refusing to delete a shared iSCSI target');
       matches.forEach((match) => {
         iqnsToDelete.push(match.iqn);
         match.disks
@@ -327,6 +290,7 @@ export class TasksController {
       logger.warn('storage.delete: iscsi target not found', { refId });
     }
 
+    if (errors.length) return this.fail(task, 'iSCSI target deletion uncertain; disk retained');
     const seen = new Set<string>();
     const deletedDisks: Array<{ pool: string; image: string; namespace?: string }> = [];
     for (const disk of disks) {
@@ -398,12 +362,12 @@ export class TasksController {
     return /^iqn\.\d{4}-\d{2}\./i.test(value);
   }
 
-  private buildTenantImageName(tenantId: string, name: string): string {
+  private buildTenantImageName(tenantId: string, name: string, operationId: string): string {
     const cleanTenant = this.normalizeSegment(tenantId);
     const cleanName = this.normalizeSegment(name);
     if (!cleanTenant || !cleanName) return '';
     const base = cleanName.startsWith(`${cleanTenant}-`) ? cleanName : `${cleanTenant}-${cleanName}`;
-    return `${base}-${this.generateUid()}`;
+    return `${base.slice(0, 120)}-${createHash('sha256').update(operationId).digest('hex').slice(0, 32)}`;
   }
 
   private normalizeSegment(value: string): string {
@@ -414,10 +378,4 @@ export class TasksController {
       .replace(/^-+|-+$/g, '');
   }
 
-  private generateUid(): string {
-    if (typeof randomUUID === 'function') {
-      return randomUUID().split('-')[0];
-    }
-    return randomBytes(4).toString('hex');
-  }
 }
